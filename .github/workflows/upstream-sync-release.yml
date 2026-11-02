@@ -106,7 +106,8 @@ jobs:
           dkp-pacman -S --needed --noconfirm \
             switch-sdl2 switch-sdl2_ttf switch-sdl2_image \
             switch-freetype switch-harfbuzz \
-            switch-curl switch-zlib switch-libminizip switch-mbedtls
+            switch-curl switch-zlib switch-mbedtls
+          # The current switch-zlib portlib also provides libminizip.a.
 
       - name: Build the main raid map viewer
         shell: bash
