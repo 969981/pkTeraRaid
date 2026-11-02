@@ -1,0 +1,190 @@
+name: Sync upstream, build and release pkTeraRaid
+
+on:
+  schedule:
+    # UTC; GitHub scheduled actions may run later than their cron time.
+    - cron: '3,13,23,33,43,53 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pkteraraid-upstream-sync-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync official upstream main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      build_sha: ${{ steps.sync.outputs.build_sha }}
+      upstream_sha: ${{ steps.sync.outputs.upstream_sha }}
+      tag: ${{ steps.sync.outputs.tag }}
+      publish: ${{ steps.sync.outputs.publish }}
+    steps:
+      - name: Checkout full main history
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Merge upstream safely and check for existing release
+        id: sync
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git remote add upstream https://github.com/Insektaure/pkTeraRaid.git
+          git fetch --no-tags upstream main
+          upstream_sha="$(git rev-parse FETCH_HEAD)"
+          if ! git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            # Do not force-push or silently discard local work.
+            git merge --no-edit "$upstream_sha"
+            git push origin HEAD:main
+          fi
+          build_sha="$(git rev-parse HEAD)"
+          tag="upstream-${upstream_sha:0:12}"
+          {
+            echo "build_sha=$build_sha"
+            echo "upstream_sha=$upstream_sha"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "Already released: $tag"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "New build needed: $tag"
+          fi
+
+  build:
+    name: Build Switch NRO and Ultrahand overlay
+    needs: sync
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    container:
+      image: devkitpro/devkita64:20260219
+    steps:
+      - name: Checkout pinned upstream build and libultrahand
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.build_sha }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Verify source and submodules
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ needs.sync.outputs.build_sha }}
+        run: |
+          set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -f overlay/lib/libultrahand/ultrahand.mk
+          test -f lib/libdmntcht.a
+          test -d romfs/maps
+
+      - name: Ensure Switch development libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+          echo "DEVKITPRO=$DEVKITPRO"
+          # dkp-pacman --needed avoids downloading packages already installed.
+          dkp-pacman -S --needed --noconfirm \
+            switch-sdl2 switch-sdl2_ttf switch-sdl2_image \
+            switch-freetype switch-harfbuzz \
+            switch-curl switch-zlib switch-libminizip switch-mbedtls
+
+      - name: Build the main raid map viewer
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+          make -j2
+          test -s pkTeraRaid.nro
+
+      - name: Build the Ultrahand overlay
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEVKITPRO="${DEVKITPRO:-/opt/devkitpro}"
+          make -C overlay -j2
+          test -s overlay/pkTeraRaid.ovl
+
+      - name: Assemble and verify Switch installation ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets/stage/switch/pkTeraRaid
+          mkdir -p release-assets/stage/switch/.overlays
+          cp pkTeraRaid.nro release-assets/stage/switch/pkTeraRaid/pkTeraRaid.nro
+          cp overlay/pkTeraRaid.ovl release-assets/stage/switch/.overlays/pkTeraRaid.ovl
+          cp pkTeraRaid.nro release-assets/pkTeraRaid.nro
+          cp overlay/pkTeraRaid.ovl release-assets/pkTeraRaid.ovl
+          (cd release-assets/stage && zip -qr ../pkTeraRaid-Switch.zip switch)
+          unzip -Z1 release-assets/pkTeraRaid-Switch.zip | grep -Fx 'switch/pkTeraRaid/pkTeraRaid.nro' >/dev/null
+          unzip -Z1 release-assets/pkTeraRaid-Switch.zip | grep -Fx 'switch/.overlays/pkTeraRaid.ovl' >/dev/null
+          test -s release-assets/pkTeraRaid-Switch.zip
+          (cd release-assets && sha256sum pkTeraRaid.nro pkTeraRaid.ovl pkTeraRaid-Switch.zip > SHA256SUMS.txt)
+          mkdir -p release-dist
+          cp release-assets/pkTeraRaid.nro release-assets/pkTeraRaid.ovl release-assets/pkTeraRaid-Switch.zip release-assets/SHA256SUMS.txt release-dist/
+
+      - name: Upload verified release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkTeraRaid-release-packages
+          path: release-dist/*
+          retention-days: 7
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [sync, build]
+    if: needs.sync.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: pkTeraRaid-release-packages
+          path: dist
+
+      - name: Publish the upstream revision exactly once
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.sync.outputs.tag }}
+          BUILD_SHA: ${{ needs.sync.outputs.build_sha }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          for name in pkTeraRaid.nro pkTeraRaid.ovl pkTeraRaid-Switch.zip SHA256SUMS.txt; do
+            test -s "dist/$name"
+          done
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Already released: $TAG"
+            exit 0
+          fi
+          printf 'Unofficial automated build of pkTeraRaid from https://github.com/Insektaure/pkTeraRaid\n\nUpstream commit: %s\nBuild commit: %s\n\nIncludes the main Nintendo Switch raid map viewer (.nro), the separate Ultrahand Legends Arceus overlay (.ovl), an SD-card-ready ZIP and SHA-256 checksums. The main NRO embeds the source romfs assets.\n\nPlease verify the supported game versions (as documented in the upstream README) and test in your own Switch environment. This is not an official upstream release.\n' "$UPSTREAM_SHA" "$BUILD_SHA" > notes.md
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$BUILD_SHA" \
+            --title "pkTeraRaid automatic build ($TAG)" \
+            --notes-file notes.md \
+            --latest
